@@ -1,0 +1,130 @@
+FUNCTION_BLOCK POU 
+(*Модуль перемещения шагового двигателя. Калибровка осуществляется прогоном модуля в ненагруженном режиме в каждую сторону с записью эталонного времени. В рабочем режиме если за эталонное время и допуск на момент инерции концевой выключатель не отработал, модуль останавливается и выводится сигнал аварии*)
+VAR_INPUT
+    xCal    : BOOL;             // запуск калибровки (по фронту.
+    xStart  : BOOL;             // ход к противоположному концевику (по фронту).
+    xAck    : BOOL;             // квитирование аварии.
+    xLimL   : BOOL;             // левый концевой выключатель, TRUE = сработал.
+    xLimR   : BOOL;             // правый концевой выключатель, TRUE = сработал.
+    tTol    : TIME := T#300MS;  // допуск на время рабочего хода.
+    tMaxCal : TIME := T#20S;    // предельное время хода при калибровке.
+END_VAR
+VAR_OUTPUT
+    xMoveL  : BOOL;             // команда «влево» на генератор импульсов.
+    xMoveR  : BOOL;             // команда «вправо» на генератор импульсов.
+    xReady  : BOOL;             // откалиброван и стоит на концевом выключателе.
+    xAlarm  : BOOL;             // авария, движение остановлено.
+    xWarn   : BOOL;             // концевой выключатель сработал раньше эталона.
+    iFault  : INT;              // код аварии.
+    tCalR   : TIME;             // эталонное время хода L->R.
+    tCalL   : TIME;             // эталонное время хода R->L.
+    tLast   : TIME;             // время последнего рабочего хода.
+END_VAR
+VAR
+    iState  : INT;              // шаг автомата состояний.
+    tonMove : TON;              // измерение времени хода и тайм-аут.
+    tLimit  : TIME;             // предел времени текущего хода.
+    tRef    : TIME;             // эталон для текущего хода.
+    rtCal   : R_TRIG;
+    rtStart : R_TRIG;
+END_VAR
+rtCal(CLK := xCal);
+rtStart(CLK := xStart);
+// Таймер идёт, пока выдана команда движения. Между ходами команда снимается минимум на один цикл ПЛК, поэтому таймер сбрасывается сам.
+tonMove(IN := xMoveL OR xMoveR, PT := tLimit);
+// Сработка обеих концевых выключателей сразу физически невозможна: неисправна цепь датчиков.
+IF xLimL AND xLimR AND iState <> 99 THEN
+    iFault := 3;
+    iState := 99;
+END_IF
+CASE iState OF
+0:  // ожидание калибровки: только по команде - нет неожиданного пуска.
+    IF rtCal.Q THEN
+        tLimit := tMaxCal;
+        iState := 10;
+    END_IF
+10: // выход на левый концевой выключатель - исходное положение.
+    xMoveL := NOT xLimL;
+    IF xLimL THEN
+        iState := 20;
+    ELSIF tonMove.Q THEN
+        iFault := 4;
+        iState := 99;
+    END_IF
+20: // калибровка: ход вправо, запись эталонного времени.
+    xMoveR := TRUE;
+    IF xLimR THEN
+        xMoveR := FALSE;
+        tCalR  := tonMove.ET;
+        iState := 30;
+    ELSIF tonMove.Q THEN
+        iFault := 4;
+        iState := 99;
+    END_IF
+30: // калибровка: ход влево, запись эталонного времени.
+    xMoveL := TRUE;
+    IF xLimL THEN
+        xMoveL := FALSE;
+        tCalL  := tonMove.ET;
+        iState := 40;
+    ELSIF tonMove.Q THEN
+        iFault := 4;
+        iState := 99;
+    END_IF
+ 40: // готов: ждём команду на ход или повторную калибровку.
+    xReady := TRUE;
+    IF rtCal.Q THEN
+        xReady := FALSE;
+        tLimit := tMaxCal;
+        iState := 10;
+    ELSIF rtStart.Q THEN
+        xReady := FALSE;
+        IF xLimL THEN
+            tRef   := tCalR;
+            iState := 50;
+        ELSIF xLimR THEN
+            tRef   := tCalL;
+            iState := 60;
+        ELSE
+            iFault := 5; // каретка не на концевом выключателе - положение неизвестно.
+            iState := 99;
+        END_IF
+        tLimit := tRef + tTol;
+    END_IF
+ 50: // рабочий ход вправо с контролем времени.
+    xMoveR := TRUE;
+    IF xLimR THEN
+        xMoveR := FALSE;
+        tLast  := tonMove.ET;
+        xWarn  := tLast + tTol < tRef;// приехал раньше эталона.
+        iState := 40;
+    ELSIF tonMove.Q THEN // время вышло, а сигнала с концевого выключателя нет.
+        iFault := 1;
+        iState := 99;
+    END_IF
+60: // рабочий ход влево с контролем времени.
+    xMoveL := TRUE;
+    IF xLimL THEN
+        xMoveL := FALSE;
+        tLast  := tonMove.ET;
+        xWarn  := tLast + tTol < tRef;
+        iState := 40;
+    ELSIF tonMove.Q THEN
+        iFault := 2;
+        iState := 99;
+    END_IF
+99: // авария: ждём квитирования, после него нужна повторная калибровка.
+    IF xAck AND NOT (xLimL AND xLimR) THEN
+        xAlarm := FALSE;
+        xWarn  := FALSE;
+        iFault := 0;
+        iState := 0;
+    END_IF
+END_CASE
+// Останов в том же цикле ПЛК, в котором обнаружена авария.
+IF iState = 99 THEN
+    xMoveL := FALSE;
+    xMoveR := FALSE;
+    xReady := FALSE;
+    xAlarm := TRUE;
+END_IF
